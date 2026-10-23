@@ -1,153 +1,144 @@
-# Domyn hybrid attention — attention, decoding, and benchmarks
+# Hybrid Sliding Window and Multi-head Latent Attention
 
-The mathematical attention modules and single-token KV-cache decoding are
-implemented and tested. The four variants use two classes in `attention.py`:
+A minimal PyTorch implementation of a **hybrid attention mechanism combining Sliding Window Attention (SWA) and Multi-head Latent Attention (MLA)**, developed as a take-home assignment for the Junior AI Research Engineer position at Domyn.
 
-| Variant | Class | `window_size` |
+The goal is to implement the mechanisms faithfully, verify their mathematical correctness, and compare their **KV-cache footprint and single-token decoding latency** against standard Multi-Head Attention (MHA). The project prioritizes clarity and reproducibility over production-level optimization.
+
+## Attention variants
+
+| Variant | Attention scope | KV cache |
 | --- | --- | --- |
-| MHA | `MHA` | `None` |
-| SWA | `MHA` | Positive integer |
-| MLA | `MLA` | `None` |
-| SWA + MLA | `MLA` | Positive integer |
+| **MHA** | All previous tokens (causal) | Full per-head Keys and Values |
+| **SWA** | Most recent `W` tokens | Window of full per-head Keys and Values |
+| **MLA** | All previous tokens (causal) | Shared compressed KV latents and positional Keys |
+| **SWA + MLA** | Most recent `W` tokens | Window of compressed KV latents and positional Keys |
 
-The hybrid applies a local causal mask inside MLA. All inputs and outputs have
-shape `(batch, sequence, d_model)`.
+The hybrid combines two complementary ideas: **SWA limits how many positions each query can attend to; MLA reduces how much information must be cached per position**. All four variants are implemented using two attention modules (`MHA` and `MLA`), each with an optional sliding-window size.
 
-## Benchmarks
+## Implementation
 
-`benchmark.py` compares cached single-token decoding for the four variants,
-reporting latency, actual returned-cache storage, parameters, projection shapes,
-and analytical MAC counts. From the configured project environment:
+### Sliding Window Attention
 
-```sh
-python3 -B benchmark.py --output results/decode.json
-```
-
-See [BENCHMARKS.md](BENCHMARKS.md) for the exact protocol, theoretical complexity,
-experimental settings, limitations, and the recorded CPU results. Raw samples
-are in [results/decode_cpu_float32.json](results/decode_cpu_float32.json).
-No parallel prefill, training, or full-model timing is reported.
-
-## Run the tests
-
-Validated with Python 3.12.3 and PyTorch 2.10.0 on CPU. The existing installation
-provided PyTorch, so this increment required no package download or installation.
-MPS was unavailable in the execution environment; no GPU results are claimed.
-
-From the project directory on the external SSD:
-
-```sh
-cd /Volumes/T7-apps/domyn_attention
-mkdir -p .tmp .cache/pip
-export TMPDIR="$PWD/.tmp"
-export PIP_CACHE_DIR="$PWD/.cache/pip"
-export PYTHONDONTWRITEBYTECODE=1
-python3 -B -m unittest -v
-```
-
-To reproduce with a new environment, create it on the SSD, install the pinned
-dependency, and use that interpreter for the same tests:
-
-```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -B -m unittest -v
-```
-
-There are no datasets, pretrained weights, or test dependencies to download.
-The tests fix the random seed before each test. Float64 output and gradient
-comparisons use `rtol=1e-9, atol=1e-10`; float32 comparisons use
-`rtol=1e-4, atol=1e-6`. Additional exact identities use zero tolerance.
-
-## Mathematical contract
-
-Let `D=d_model`, `H=num_heads`, and `d=D/H`. A window of `W` includes the current
-token, so query position `t` can attend to precisely these positions:
+For a query at position `t`, a window of size `W` permits attention only to Key positions `j` satisfying:
 
 ```text
-max(0, t-W+1) <= j <= t
+max(0, t - W + 1) <= j <= t
 ```
 
-With no window, every `0 <= j <= t` is visible. A window of one permits only
-self-attention, and a window at least as long as the sequence gives full causal
-attention. The window convention is explicit to avoid ambiguity about whether
-the current token counts toward its size.
+The current token counts toward the window. With `W=1`, a token attends only to itself; with `W` at least as large as the sequence, SWA is equivalent to full causal attention. The full-sequence implementation uses a **dense local causal mask** for simplicity and correctness.
 
-The following equations use column vectors, as in the papers. PyTorch stores
-`nn.Linear` weights as `(output_features, input_features)` and computes
-`x @ weight.T` on batched row vectors.
+### Multi-head Latent Attention
 
-### MHA
+MLA follows **DeepSeek-V2, Section 2.1**. Instead of storing full historical Keys and Values, it learns a shared low-rank KV representation `c_kv`. Query compression is also implemented.
 
-Each head has independent query, key, and value projection rows. Queries and keys
-are rotated at their token positions; values are not rotated:
+To preserve relative positional information without losing the benefits of KV compression, **Decoupled RoPE** separates content and positional components. Each head has its own positional Query, while the positional Key is shared across heads:
 
 ```text
-q[t,i] = RoPE_t(W_Q[i] x[t])
-k[t,i] = RoPE_t(W_K[i] x[t])
-v[t,i] = W_V[i] x[t]
-score[t,j,i] = dot(q[t,i], k[j,i]) / sqrt(d)
-```
+c_kv[t] = W_DKV x[t]                         # shared KV latent
+c_q[t]  = W_DQ  x[t]                         # shared Query latent
 
-For each query and head, softmax is over the permitted key positions. The
-weighted value sums are concatenated and passed through the output projection.
+q_content[t,i] = W_UQ[i] c_q[t]
+k_content[t,i] = W_UK[i] c_kv[t]
+v[t,i]         = W_UV[i] c_kv[t]
 
-### MLA
-
-The implementation follows DeepSeek-V2 section 2.1, equations (9)-(19).
-`r=kv_rank` and `r_q=q_rank` are shared latent dimensions, not per-head widths.
-Choose them below `D` when demonstrating compression; positive larger widths
-are mathematically valid but do not provide that bottleneck.
-
-```text
-c_kv[t] = W_DKV x[t]                       # r features
-c_q[t]  = W_DQ x[t]                        # r_q features
-
-q_content[t,i] = W_UQ[i] c_q[t]            # d features per head
-k_content[t,i] = W_UK[i] c_kv[t]           # d features per head
-v[t,i]         = W_UV[i] c_kv[t]           # d features per head
-
-q_position[t,i] = RoPE_t(W_QR[i] c_q[t])   # rope_dim features per head
-k_position[t]   = RoPE_t(W_KR x[t])        # rope_dim features, shared by heads
+q_position[t,i] = RoPE_t(W_QR[i] c_q[t])
+k_position[t]   = RoPE_t(W_KR x[t])          # shared across heads
 
 score[t,j,i] = (
     dot(q_content[t,i], k_content[j,i])
     + dot(q_position[t,i], k_position[j])
-) / sqrt(d + rope_dim)
+) / sqrt(head_dim + rope_dim)
 ```
 
-Softmax, value aggregation, and the output projection follow the same rule as
-MHA. Concatenating content and positional coordinates implements the sum of dot
-products above. The scale uses their combined width, not the latent width.
+The two score contributions are added **before a single Softmax**. Keeping RoPE out of the content Keys is essential for efficient compressed-cache decoding.
 
-Keeping position out of the content keys is essential for moving the key
-up-projection onto the query side during compressed-cache decoding. Applying
-RoPE to the content keys would obstruct that rearrangement. The positional key
-is projected directly from `x`, as specified in the paper.
+### Compressed KV-cache decoding
 
-## KV-cache decoding
-
-Both classes expose the same inference interface:
+Both attention modules provide the same inference interface:
 
 ```python
-output, cache = model.decode(token, cache)
+output, cache = model.decode(token, cache)  # cache=None for the first token
 ```
 
-`token` and `output` have shape `(batch, 1, d_model)`. Pass `cache=None` to start
-a new sequence, then retain the returned cache for the next call. The caller
-owns the state; decoding does not mutate earlier caches or store sequence state
-inside the module. A small named tuple gives each cached tensor an explicit name.
+Here `token` and `output` have shape `(batch, 1, d_model)`. Each call returns a new cache without mutating the previous one.
 
-All rows in a batch advance together. Keep the same model weights, window size,
-batch, dtype, and device while reusing a cache. `decode` disables autograd;
-training continues to use `forward`.
+- **MHA/SWA** store rotated Keys and unrotated Values, each with shape `(B, H, N, d)`.
+- **MLA/hybrid** store only a shared KV latent `(B, N, r)` and a shared rotated positional Key `(B, N, R)`; no historical full K/V or Query latents are cached.
+- **Windowed variants** retain at most `W` positions. Absolute RoPE positions continue increasing after older entries are evicted.
 
-The cache records `position`, the next absolute token position. This equals the
-total number of processed tokens even after older entries are evicted. Queries
-and newly cached keys receive RoPE at this position; cached keys are already
-rotated and are not rotated again.
+For each head, MLA avoids reconstructing historical content Keys and Values using these equivalent rearrangements:
 
-For example, a prompt can be processed through the same single-token interface:
+```text
+q^T (W_UK c_j)          = (W_UK^T q)^T c_j
+sum_j a_j (W_UV c_j)   = W_UV (sum_j a_j c_j)
+```
+
+Thus the Key up-projection moves to the current Query, and the Value up-projection is applied **after** aggregating the cached latents. The attention scaling remains `1 / sqrt(head_dim + rope_dim)`.
+
+The decoder uses simple cache concatenation and trimming; it does **not** use a preallocated circular buffer.
+
+## Results
+
+The following results come from one recorded **CPU float32, single-token decoding** run on an **Apple M1 MacBook Air (8 GB RAM)**. Settings: `d_model=128`, `num_heads=4`, `kv_rank=32`, `q_rank=64`, `rope_dim=16`, batch size 1, and a **512-token prefix**. Windowed variants use `W=64`; times are medians over 50 measured calls after 10 warmups.
+
+| Variant | Parameters | Cached tokens | KV cache (KiB) | Median decode (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| MHA | 65,536 | 513 | 513.00 | 142.46 |
+| SWA | 65,536 | 64 | 64.00 | 131.75 |
+| MLA | 51,200 | 513 | 96.19 | 162.08 |
+| **SWA + MLA** | **51,200** | **64** | **12.00** | **155.96** |
+
+**Key observations:**
+
+- The hybrid uses **42.75× less returned KV-cache storage than full MHA**, combining a shorter visible context with latent compression. These variants do **not** retain the same number of tokens.
+- Compared with SWA alone, the hybrid uses **5.33× less cache storage at the same 64-token window**, isolating the additional benefit of MLA compression.
+- The hybrid is **approximately 9.5% slower than MHA** in this CPU run. Reduced cache storage does not automatically imply reduced latency, especially with eager PyTorch operators and cache-copy overhead.
+
+Cache measurements cover the **backing storage of returned cache tensors**, not temporary allocations, peak memory, or full process memory. These are small, untrained attention modules on synthetic inputs; the measurements do not establish language-model quality or universal speedups.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the full methodology, additional prefix lengths, theoretical operation counts, hardware information, and limitations. Raw measurements are in [`results/decode_cpu_float32.json`](results/decode_cpu_float32.json).
+
+## Project structure
+
+```text
+domyn-attention/
+├── attention.py                  # MHA, MLA, optional SWA, and cached decoding
+├── benchmark.py                  # Reproducible single-token decode benchmark
+├── tests/
+│   ├── test_attention.py         # Attention, RoPE, gradient, and cache tests
+│   └── test_benchmark.py         # Benchmark protocol and accounting tests
+├── results/
+│   └── decode_cpu_float32.json   # Recorded raw CPU measurements
+├── README.md
+├── BENCHMARKS.md
+├── requirements.txt
+└── .gitignore
+```
+
+## Setup and usage
+
+Requires Python and PyTorch. To create a local virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+**Run the tests** from the repository root:
+
+```bash
+.venv/bin/python -B -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+The documented test suite contains **15 tests**, covering independent attention references, input/parameter gradients, RoPE, causal and window boundaries, full-sequence versus cached decoding, cache eviction/storage, and benchmark accounting. CPU float32 and float64 are used for numerical verification; there are no speed thresholds in the tests.
+
+**Run the decoding benchmark** with its default CPU settings:
+
+```bash
+.venv/bin/python -B benchmark.py --output results/decode.json
+```
+
+Example of incremental decoding with the hybrid:
 
 ```python
 import torch
@@ -160,157 +151,26 @@ outputs = []
 for token in x.split(1, dim=1):
     output, cache = model.decode(token, cache)
     outputs.append(output)
+
 decoded = torch.cat(outputs, dim=1)
 torch.testing.assert_close(decoded, model(x), rtol=1e-4, atol=1e-6)
 ```
 
-This includes ten positions and several evictions from a four-token window.
-There is no separate parallel prefill API in this increment.
+The `forward()` method processes complete sequences and is differentiable; `decode()` handles one token at a time with autograd disabled. A separate cache-producing parallel prefill API is not implemented.
 
-### MHA cache
+## Scope and limitations
 
-MHA stores rotated keys and unrotated values, each of shape `(B, H, N, d)`.
-Each call projects only the new token, appends its key/value, and drops entries
-outside the window. The newest query can attend to every retained entry,
-including itself, so decoding needs no causal mask.
+This implementation emphasizes **mathematical correctness, understandable code, and reproducible measurements** rather than production performance.
 
-### MLA cache and rearrangement
-
-MLA stores only:
-
-- `latent`: the shared KV latent, shape `(B, N, r)`;
-- `rope_key`: the shared rotated positional key, shape `(B, N, rope_dim)`.
-
-Neither tensor has a head axis. Query latents, historical expanded keys, and
-historical expanded values are not cached.
-
-The decoding computation uses the associative law, as described in DeepSeek-V2
-Appendix C. For one head, with the same weights as the full-sequence forward:
-
-```text
-q_content^T (W_UK c_j) = (W_UK^T q_content)^T c_j
-
-sum_j a_j (W_UV c_j) = W_UV (sum_j a_j c_j)
-```
-
-The first identity moves the key up-projection onto the current query. Its dot
-product with each cached latent gives the content score; the positional dot
-product is added separately. The scale remains `sqrt(d + rope_dim)`, because
-rearranging a product must not change its numerical value or normalization.
-
-The second identity aggregates latents with the attention probabilities before
-applying the value up-projection. Only one output vector per head is expanded;
-historical content K/V are never reconstructed during decoding. These identities
-depend on the projections being linear. The implementation uses the existing
-weights directly, without building or maintaining pre-fused projection matrices.
-
-### Cache storage and update cost
-
-Let `N` be the number of retained tokens: all processed tokens without a window,
-or at most `W` with a window. The tensor payload per layer is:
-
-| Cache | Elements | Bytes |
-| --- | --- | --- |
-| MHA / SWA | `2 * B * N * H * d` | Elements times dtype size |
-| MLA / hybrid | `B * N * (r + rope_dim)` | Elements times dtype size |
-
-The tests verify the contents and underlying tensor-storage bytes against these
-formulas after every decoding step. This counts cache tensor storage, excluding
-Python metadata, model parameters, temporary tensors, and allocator overhead.
-MLA saves cache payload relative to this MHA when `r + rope_dim < 2 * H * d`.
-
-Updates use `torch.cat` followed, when needed, by trimming and cloning. Cloning
-is necessary because a sliced tensor can keep the entire larger storage alive.
-The returned windowed cache therefore owns storage for at most `W` entries.
-Existing caches are not modified, so two continuations can reuse a common prefix.
-
-This simple update copies retained data and temporarily holds additional tensors.
-Keeping old cache objects also retains their storage. Bounded returned-cache
-size is not a claim about peak process memory or constant-time updates. Global
-caches grow with sequence length; windowed caches stop growing at `W`.
-[The decoding benchmark](BENCHMARKS.md) measures latency including these updates.
-
-## Implementation choices and limits
-
-- **Dense masks:** `_attention` computes every score before masking. Windowed
-  variants have the correct visibility pattern but still use quadratic score
-  computation and storage. This increment demonstrates no sparse speedup.
-- **Expanded MLA forward:** content keys and values are materialized from the
-  latent tensors for the differentiable full-sequence calculation. The separate
-  inference-only `decode` method uses the compressed representation directly.
-- **RoPE:** adjacent coordinate pairs rotate with a fixed base of 10,000.
-  Positions start at zero for each full-sequence call and continue from the
-  cache's absolute position during decoding. There is no long-context rescaling.
-  MHA rotates its full query/key head; MLA rotates only its positional coordinates.
-- **Independent projections:** separate `nn.Linear` layers keep the mapping to
-  the equations visible. Projection fusion is unnecessary at this stage.
-- **Bias-free projections and no dropout:** the projection equations have no
-  additive biases, and omitting dropout keeps reference comparisons
-  deterministic. PyTorch's default linear initialization is retained.
-- **Attention only:** residual connections, transformer normalization, and the
-  language-model loss belong to later integration. DeepSeek's additional
-  latent normalization/scaling from its training setup is omitted: this is the
-  section 2.1 formulation, not a reproduction of the entire trained model.
-- **Fixed-length, unpadded batches:** every row in a batch has the same sequence
-  length. Padding masks, per-row decoding positions, and mixed-precision policies
-  are outside this increment. CPU float32 and float64 are tested.
-- **Comparison dimensions:** MHA query/key heads have width `d`; MLA query/key
-  heads have width `d + rope_dim`. Both have value width `d`. Equal `D` and `H`
-  therefore do not imply equal parameter counts or FLOPs. The benchmark reports
-  these differences explicitly.
-
-## What the tests establish
-
-Twelve tests in `test_attention.py` cover shapes (including a one-token sequence),
-windows, and dtypes. The eight full-sequence tests establish:
-
-1. RoPE agrees with explicit rotation matrices and preserves vector norms.
-2. MHA agrees with PyTorch's scaled dot-product attention for the same weights.
-3. Both modules' outputs, input gradients, and every parameter gradient agree
-   with a separate reference that loops over queries and heads. That reference
-   slices visible tokens instead of using the implementation's mask. MLA scores
-   use separate content and positional dot products.
-4. Changes to future tokens cannot affect past outputs.
-5. Changes before a query's window cannot affect that query; gradients outside
-   its permitted positions are zero.
-6. A window of one reduces attention to the value and output projections.
-7. A window covering the sequence exactly matches full causal attention.
-8. Invalid dimensions and nonpositive windows are rejected.
-
-The locality check concerns one layer. It does not imply that a stack of local
-layers has the same receptive field. No test expects independently parameterized
-MHA and MLA models to produce identical outputs.
-
-The four decoding tests establish:
-
-1. Token-by-token outputs match the full-sequence forward for all four variants
-   in float32 and float64, with batch sizes one and three. Windows include one,
-   three, and a size larger than the entire sequence. Eleven decoding steps
-   exercise repeated eviction. Outputs and cache tensors retain no autograd graph.
-2. Cache contents, absolute positions, and backing-storage bytes match the
-   expected projections and formulas at every step, including after eviction.
-3. A cache can be reused for two independent continuations without mutation;
-   `None` resets the sequence.
-4. Decoding rejects inputs that are not shaped `(batch, 1, d_model)`.
-
-The RoPE test also checks nonzero offsets against independent rotation matrices.
-
-Three tests in `test_benchmark.py` check the fixed-prefix timing protocol,
-backing-storage measurement, and CLI reporting of dimensions and operation
-counts. There are 15 tests in total; none asserts a timing speed threshold.
-
-## Review boundary
-
-Attention, single-token KV-cache decoding, and reproducible decoding benchmarks
-are complete. This increment stops before model integration. Sparse attention,
-parallel prefill, circular preallocated buffers, and extensive training remain
-optional extensions.
+- **Dense SWA forward:** the full-sequence path masks out-of-window positions but still computes a dense attention matrix, retaining quadratic score computation and storage. Only the cached single-token decoder limits the number of attended positions directly.
+- **MLA execution paths:** the differentiable full-sequence path expands content K/V from latents; cached decoding operates directly on compressed representations.
+- **Cache update overhead:** concatenation and trimming copy data. Returned windowed caches stay bounded, but updates are not constant-time and temporary allocations are not captured by cache-payload measurements.
+- **Controlled comparison:** model width and head count are held fixed, but MLA has different query/key projection dimensions and parameter counts. The results are not equal-parameter or equal-FLOP benchmarks.
+- **Scope:** this is an attention-mechanism implementation, not a reproduction of the full DeepSeek-V2 or Mistral models. It does not implement sparse attention kernels, long-context RoPE scaling, padding masks, MoE, or language-model quality evaluation.
 
 ## References
 
-- [Mistral 7B, section 2](https://arxiv.org/abs/2310.06825)
-- [DeepSeek-V2, section 2.1 and Appendix C](https://arxiv.org/abs/2405.04434)
-- [PyTorch 2.10 scaled dot-product attention](https://docs.pytorch.org/docs/2.10/generated/torch.nn.functional.scaled_dot_product_attention.html)
-
-This increment is written directly from the equations; no nanoGPT code has been
-copied. nanoGPT remains the proposed reference for later minimal model integration.
+- [Mistral 7B — Sliding Window Attention](https://arxiv.org/abs/2310.06825)
+- [DeepSeek-V2 — MLA, Section 2.1 and Appendix C](https://arxiv.org/abs/2405.04434)
+- [RoFormer — Rotary Position Embeddings](https://arxiv.org/abs/2104.09864)
+- [nanoGPT](https://github.com/karpathy/nanoGPT) — suggested minimal Transformer reference; no nanoGPT code is included in the current attention implementation.
