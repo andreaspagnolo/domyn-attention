@@ -96,23 +96,41 @@ The following results come from one recorded **CPU float32, single-token decodin
 
 Cache measurements cover the **backing storage of returned cache tensors**, not temporary allocations, peak memory, or full process memory. These are small, untrained attention modules on synthetic inputs; the measurements do not establish language-model quality or universal speedups.
 
-See [BENCHMARKS.md](BENCHMARKS.md) for the full methodology, additional prefix lengths, theoretical operation counts, hardware information, and limitations. Raw measurements are in [`results/decode_cpu_float32.json`](results/decode_cpu_float32.json).
+See [BENCHMARKS.md](docs/BENCHMARKS.md) for the full methodology, additional prefix lengths, theoretical operation counts, hardware information, and limitations. Raw measurements are in [`results/decode_cpu_float32.json`](results/decode_cpu_float32.json).
 
-## Project structure
+### Context-length experiment: fixed window of 64
 
-```text
-domyn-attention/
-├── attention.py                  # MHA, MLA, optional SWA, and cached decoding
-├── benchmark.py                  # Reproducible single-token decode benchmark
-├── tests/
-│   ├── test_attention.py         # Attention, RoPE, gradient, and cache tests
-│   └── test_benchmark.py         # Benchmark protocol and accounting tests
-├── results/
-│   └── decode_cpu_float32.json   # Recorded raw CPU measurements
-├── README.md
-├── BENCHMARKS.md
-├── requirements.txt
-└── .gitignore
+A new extended run on **25 October 2026** measures prefixes of **128, 256, 512, 1,024, 2,048, 4,096, 8,192, 16,384, and 32,768 tokens**, holding `W=64` and the model dimensions above fixed. All nine lengths were measured together using CPU float32, batch size 1, one intra-op thread, 10 warmups, and 50 measured calls. Prefix-cache construction is excluded. Both plot axes are logarithmic so the short-context crossover and long-context growth remain visible. Markers and whiskers show measured medians and within-case interquartile ranges, not confidence intervals or a fitted scaling law.
+
+![Measured cached decoding latency for MHA, SWA, MLA, and SWA+MLA across nine prefix lengths through 32,768 tokens](results/context_scaling_32768_cpu_float32.svg)
+
+**Experimental finding:** in this extended run, the hybrid first has a lower median than MHA at **1,024 tokens**: **159.29 µs versus 187.02 µs**. At 512 it remains slightly slower (**158.73 versus 155.46 µs**), so the sampled ordering reverses between 512 and 1,024. The [earlier six-length run](results/context_scaling_cpu_float32.json) first recorded a hybrid win at 2,048. This difference across runs reinforces that the experiment does **not** establish an exact or universal break-even threshold.
+
+The added long-context cases have these measured median latencies (µs):
+
+| Prefix tokens | MHA | SWA | MLA | SWA+MLA |
+| ---: | ---: | ---: | ---: | ---: |
+| 8,192 | 1,543.21 | 144.65 | 520.60 | 159.85 |
+| 16,384 | 2,255.81 | 134.65 | 855.35 | 160.08 |
+| 32,768 | 4,558.67 | 133.85 | 1,722.71 | 158.81 |
+
+**Theoretical interpretation:** MHA's per-step attention work and concatenation-based cache copies grow with context; windowing bounds both by `W`. MLA reduces cached features per token but has additional projection/operator overhead, so a smaller cache need not yield lower latency at short contexts. At 32,768, returned-cache storage is **32,769 KiB for MHA versus 12 KiB for the hybrid**, which retains only 64 tokens; temporary allocations and peak memory are excluded. Windowed updates still copy `O(W)` entries, and operation counts alone cannot explain the exact latency curve. The dense full-sequence SWA path remains quadratic and is not timed here.
+
+[Extended raw samples and complete settings](results/context_scaling_32768_cpu_float32.json) are retained separately from the previous run. Reproduce the sweep using the existing benchmark:
+
+```bash
+python3 -B benchmark.py --device cpu --dtype float32 --threads 1 \
+  --d-model 128 --num-heads 4 --kv-rank 32 --q-rank 64 --rope-dim 16 \
+  --batch-size 1 --window-size 64 \
+  --prefix-lengths 128 256 512 1024 2048 4096 8192 16384 32768 \
+  --warmup 10 --repeats 50 --seed 17 --output results/context_scaling_32768_cpu_float32.json
+```
+
+To regenerate the SVG, run the following with an interpreter that has **Matplotlib** installed (rendered here with version **3.11.1**). This is only a plotting dependency; the attention and benchmark requirements are unchanged. Keep its font cache on the SSD:
+
+```bash
+mkdir -p .cache/matplotlib
+MPLCONFIGDIR="$PWD/.cache/matplotlib" python3 -B scripts/plot_context.py results/context_scaling_32768_cpu_float32.json
 ```
 
 ## Setup and usage
@@ -127,7 +145,7 @@ python3 -m venv .venv
 **Run the tests** from the repository root:
 
 ```bash
-.venv/bin/python -B -m unittest discover -s tests -p 'test_*.py' -v
+.venv/bin/python -B -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 The documented test suite contains **15 tests**, covering independent attention references, input/parameter gradients, RoPE, causal and window boundaries, full-sequence versus cached decoding, cache eviction/storage, and benchmark accounting. CPU float32 and float64 are used for numerical verification; there are no speed thresholds in the tests.

@@ -65,7 +65,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(cache_storage_bytes(None), 0)
 
     def test_cli_records_all_variants_dimensions_and_analytical_counts(self):
-        directory = Path(__file__).resolve().parent
+        directory = Path(__file__).resolve().parents[1]
         # Keep subprocess output and temporary files on the external SSD.
         with tempfile.TemporaryDirectory(dir=directory) as temporary:
             output = Path(temporary) / "smoke.json"

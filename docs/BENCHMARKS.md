@@ -158,7 +158,7 @@ is not timed here and does not return a cache.
 
 ## Recorded CPU run
 
-The committed [raw results](results/decode_cpu_float32.json) were collected on
+The committed [raw results](../results/decode_cpu_float32.json) were collected on
 2026-10-23 at 11:17 UTC. Hardware: MacBook Air (MacBookAir10,1), Apple M1, 8 GB RAM.
 Environment: macOS 26.5.2 ARM64, Python 3.12.3, PyTorch 2.10.0, CPU float32,
 one intra-op thread and eight inter-op threads. Float32 matmul precision was
@@ -202,7 +202,7 @@ evaluate the quality cost of compression and restricted context.
 
 ## Validation
 
-Run `python3 -B -m unittest -v`. All 15 tests passed for this increment: the 12
+Run `python3 -B -m unittest discover -s scripts -p 'test_*.py' -v` from the repository root. All 15 tests passed for this increment: the 12
 attention/decoding tests plus three benchmark tests. The latter verify fixed
 prefix reuse, warmup exclusion, backing-storage accounting, and complete CLI
 reporting of all four variants with known parameter and MAC counts. They do not
