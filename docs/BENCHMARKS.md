@@ -10,21 +10,24 @@ and complete language-model generation are not measured.
 
 ## Reproduction
 
-Use the Python/PyTorch environment described in the README. Keep generated files
-and temporary storage on the external SSD:
+Use the Python/PyTorch environment described in the [README](../README.md).
+Run from the repository root, keeping temporary storage in the project directory:
 
 ```sh
-cd /Volumes/T7-apps/domyn_attention
 mkdir -p .tmp .cache/pip
 export TMPDIR="$PWD/.tmp"
 export PIP_CACHE_DIR="$PWD/.cache/pip"
 export PYTHONDONTWRITEBYTECODE=1
-python3 -B benchmark.py \
+.venv/bin/python -B benchmark.py \
   --device cpu --dtype float32 --threads 1 \
   --d-model 128 --num-heads 4 --kv-rank 32 --q-rank 64 --rope-dim 16 \
-  --window-size 64 --batch-size 1 --prefix-lengths 32 128 512 \
-  --warmup 10 --repeats 50 --seed 17 --output results/decode.json
+  --window-size 64 --batch-size 1 \
+  --prefix-lengths 128 256 512 1024 2048 4096 8192 16384 32768 \
+  --warmup 10 --repeats 50 --seed 17 --output results/context_scaling_32768_cpu_float32.json
 ```
+
+This replaces the recorded JSON; regenerate its SVG with the plotting command
+in the README. Sequential prefix construction can take several minutes.
 
 The JSON contains raw samples, medians, quartiles, all CLI settings, hardware,
 Python/PyTorch versions, PyTorch build details, thread counts, projection weight
@@ -158,8 +161,9 @@ is not timed here and does not return a cache.
 
 ## Recorded CPU run
 
-The committed [raw results](../results/decode_cpu_float32.json) were collected on
-2026-10-23 at 11:17 UTC. Hardware: MacBook Air (MacBookAir10,1), Apple M1, 8 GB RAM.
+The committed [raw results](../results/context_scaling_32768_cpu_float32.json)
+come from a run started on 2026-10-25 at 10:47 UTC.
+Hardware: MacBook Air (MacBookAir10,1), Apple M1, 8 GB RAM.
 Environment: macOS 26.5.2 ARM64, Python 3.12.3, PyTorch 2.10.0, CPU float32,
 one intra-op thread and eight inter-op threads. Float32 matmul precision was
 `highest`. MPS and CUDA were unavailable in the execution environment.
@@ -167,33 +171,31 @@ one intra-op thread and eight inter-op threads. Float32 matmul precision was
 Settings: `B=1, D=128, H=4, r=32, q=64, R=16, W=64`; 10 warmups and 50 measured
 calls per case. Model/order seed: 17; input seed: 18. These are the explicit
 settings in the reproduction command above. All results are for untrained
-attention modules on synthetic inputs.
+attention modules on synthetic inputs. The run covers all four variants at nine
+prefix lengths from 128 through 32,768 tokens: 36 cases and 1,800 timed samples.
+The README contains all median latencies and the measured plot. At the
+32,768-token prefix:
 
 | Prefix tokens | Variant | Visible tokens | Cache KiB | Median µs | Q25–Q75 µs |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 32 | MHA | 33 | 33.000 | 123.10 | 122.89–123.41 |
-| 32 | SWA | 33 | 33.000 | 122.79 | 122.62–122.88 |
-| 32 | MLA | 33 | 6.188 | 148.75 | 148.47–151.16 |
-| 32 | SWA+MLA | 33 | 6.188 | 148.33 | 148.17–149.26 |
-| 128 | MHA | 129 | 129.000 | 126.42 | 126.25–126.57 |
-| 128 | SWA | 64 | 64.000 | 131.52 | 131.30–131.91 |
-| 128 | MLA | 129 | 24.188 | 150.21 | 150.00–150.49 |
-| 128 | SWA+MLA | 64 | 12.000 | 157.10 | 155.64–159.01 |
-| 512 | MHA | 513 | 513.000 | 142.46 | 142.38–142.70 |
-| 512 | SWA | 64 | 64.000 | 131.75 | 131.58–131.99 |
-| 512 | MLA | 513 | 96.188 | 162.08 | 161.69–162.68 |
-| 512 | SWA+MLA | 64 | 12.000 | 155.96 | 155.83–156.90 |
+| 32,768 | MHA | 32,769 | 32,769.000 | 4,558.67 | 4,312.23–4,787.27 |
+| 32,768 | SWA | 64 | 64.000 | 133.85 | 133.51–136.46 |
+| 32,768 | MLA | 32,769 | 6,144.188 | 1,722.71 | 1,619.93–1,808.45 |
+| 32,768 | SWA+MLA | 64 | 12.000 | 158.81 | 158.60–159.88 |
 
-At a 512-token prefix, the measured returned-cache storage is 525,312 bytes for
-MHA and 12,288 bytes for the hybrid. The hybrid retains only 64 tokens and uses
-compressed entries; this is not a comparison at equal retained context. Its
-median latency is higher than MHA's in this run despite the smaller cache.
+The measured returned-cache storage is 33,555,456 bytes for MHA and 12,288 bytes
+for the hybrid at this prefix. The hybrid retains only 64 tokens, so this
+comparison combines restricted context with compression. Comparing the hybrid
+with SWA isolates compression at the same window: 12 KiB versus 64 KiB, but
+158.81 µs versus 133.85 µs median latency.
 
-At the 128-token prefix, both windowed variants also have higher median latency
-than their global counterparts despite less attention mixing. The implementation
-contains extra eviction copies and several separate operators; these observations
-do not isolate which operation causes any timing difference. No profiling or
-optimization ablation was performed.
+The hybrid's median first falls below MHA's at the sampled 1,024-token prefix
+(159.29 versus 187.02 µs); at 512 it is still higher (158.73 versus 155.46 µs).
+This locates a reversal in sampled ordering, not an exact break-even point.
+Windowed latencies remain roughly flat across the sweep, while global MHA and
+MLA latencies grow. The implementation includes cache copies and separate
+projection/attention operators; no profiling or optimization ablation isolates
+their individual contributions.
 
 These measurements demonstrate cache-footprint reductions and the actual behavior
 of this small eager implementation on this CPU. They do not establish that MLA or
@@ -202,9 +204,10 @@ evaluate the quality cost of compression and restricted context.
 
 ## Validation
 
-Run `python3 -B -m unittest discover -s scripts -p 'test_*.py' -v` from the repository root. All 15 tests passed for this increment: the 12
+Run `.venv/bin/python -B -m unittest discover -s scripts -p 'test_*.py' -v`
+from the repository root. The suite contains 15 tests: the 12
 attention/decoding tests plus three benchmark tests. The latter verify fixed
 prefix reuse, warmup exclusion, backing-storage accounting, and complete CLI
 reporting of all four variants with known parameter and MAC counts. They do not
 assert speed thresholds. The saved run's source hashes were checked against the
-measured files. Model integration remains outside this increment.
+measured files. Model integration is outside the scope of this submission.
