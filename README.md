@@ -196,4 +196,3 @@ This implementation emphasizes **mathematical correctness, understandable code, 
 - [Mistral 7B — Sliding Window Attention](https://arxiv.org/abs/2310.06825)
 - [DeepSeek-V2 — MLA, Section 2.1 and Appendix C](https://arxiv.org/abs/2405.04434)
 - [RoFormer — Rotary Position Embeddings](https://arxiv.org/abs/2104.09864)
-- [nanoGPT](https://github.com/karpathy/nanoGPT) — suggested minimal Transformer reference; no nanoGPT code is included in the current attention implementation.
